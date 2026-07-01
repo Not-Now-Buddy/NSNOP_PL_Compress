@@ -1,0 +1,15 @@
+{
+  "name": "pdf-compress-bridge",
+  "version": "1.0.0",
+  "description": "Downloads large PDFs from Drive, compresses with Ghostscript, uploads result back to Drive. Exists to bypass Apps Script's ~50MB file/transfer ceiling.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
