@@ -31,9 +31,12 @@ app.post('/compress', async (req, res) => {
   let workDir;
   try {
     if (!API_KEY || req.header('X-Api-Key') !== API_KEY) {
-      return res.status(401).json({ success: false, error: 'Unauthorized' });
-    }
-
+     console.log('Expected key length:', API_KEY ? API_KEY.length : 0);
+     console.log('Received key length:', req.header('X-Api-Key') ? req.header('X-Api-Key').length : 0);
+     console.log('Expected key (first/last 4):', API_KEY ? (API_KEY.slice(0,4) + '...' + API_KEY.slice(-4)) : 'none');
+     console.log('Received key (first/last 4):', req.header('X-Api-Key') ? (req.header('X-Api-Key').slice(0,4) + '...' + req.header('X-Api-Key').slice(-4)) : 'none');
+     return res.status(401).json({ success: false, error: 'Unauthorized' });
+   }
     const { fileId, oauthToken } = req.body || {};
     if (!fileId || !oauthToken) {
       return res.status(400).json({ success: false, error: 'fileId and oauthToken are required' });
