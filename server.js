@@ -6,16 +6,59 @@ const { execFile } = require('child_process');
 const { pipeline } = require('stream/promises');
 
 const app = express();
-app.use(express.json({ limit: '2mb' })); // request body is just JSON metadata, always tiny
+app.use(express.json({ limit: '2mb' }));
 
-const API_KEY = process.env.API_KEY;          // shared secret - set at deploy time
-const TARGET_MAX_BYTES = 25 * 1024 * 1024;     // Gmail's per-email attachment cap
+const API_KEY = process.env.API_KEY;
+const TARGET_MAX_BYTES = 25 * 1024 * 1024;
+
+// Account B (Drive storage account) OAuth config - used for BOTH
+// downloading the source file and uploading the compressed result,
+// so all Drive storage is attributed to Account B, not Account A.
+const DRIVE_B_CLIENT_ID = process.env.DRIVE_B_CLIENT_ID;
+const DRIVE_B_CLIENT_SECRET = process.env.DRIVE_B_CLIENT_SECRET;
+const DRIVE_B_REFRESH_TOKEN = process.env.DRIVE_B_REFRESH_TOKEN;
+const DRIVE_B_OUTPUT_FOLDER_ID = process.env.DRIVE_B_OUTPUT_FOLDER_ID;
+
+// -----------------------------------------------------------------------
+// Account B access token, refreshed from the long-lived refresh token.
+// Access tokens expire in ~1hr, so cache and refresh a bit early rather
+// than on every single request.
+// -----------------------------------------------------------------------
+let cachedAccessToken = null;
+let cachedAccessTokenExpiresAt = 0;
+
+async function getAccountBAccessToken() {
+  const now = Date.now();
+  if (cachedAccessToken && now < cachedAccessTokenExpiresAt - 60000) {
+    return cachedAccessToken;
+  }
+
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: DRIVE_B_CLIENT_ID,
+      client_secret: DRIVE_B_CLIENT_SECRET,
+      refresh_token: DRIVE_B_REFRESH_TOKEN,
+      grant_type: 'refresh_token'
+    })
+  });
+
+  const data = await resp.json();
+  if (!data.access_token) {
+    throw new Error(`Failed to refresh Account B access token: ${JSON.stringify(data)}`);
+  }
+
+  cachedAccessToken = data.access_token;
+  cachedAccessTokenExpiresAt = now + (data.expires_in ? data.expires_in * 1000 : 3300000);
+  return cachedAccessToken;
+}
 
 function runGhostscript(inputPath, outputPath, settingLevel) {
   return new Promise((resolve, reject) => {
     execFile('gs', [
       '-sDEVICE=pdfwrite',
-      `-dPDFSETTINGS=/${settingLevel}`, // "ebook" = good quality/size balance, "screen" = more aggressive
+      `-dPDFSETTINGS=/${settingLevel}`,
       '-dCompatibilityLevel=1.4',
       '-dNOPAUSE', '-dBATCH', '-dQUIET',
       `-sOutputFile=${outputPath}`,
@@ -31,29 +74,27 @@ app.post('/compress', async (req, res) => {
   let workDir;
   try {
     if (!API_KEY || req.header('X-Api-Key') !== API_KEY) {
-     console.log('Expected key length:', API_KEY ? API_KEY.length : 0);
-     console.log('Received key length:', req.header('X-Api-Key') ? req.header('X-Api-Key').length : 0);
-     console.log('Expected key (first/last 4):', API_KEY ? (API_KEY.slice(0,4) + '...' + API_KEY.slice(-4)) : 'none');
-     console.log('Received key (first/last 4):', req.header('X-Api-Key') ? (req.header('X-Api-Key').slice(0,4) + '...' + req.header('X-Api-Key').slice(-4)) : 'none');
-     return res.status(401).json({ success: false, error: 'Unauthorized' });
-   }
-    const { fileId, oauthToken } = req.body || {};
-    if (!fileId || !oauthToken) {
-      return res.status(400).json({ success: false, error: 'fileId and oauthToken are required' });
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
+
+    const { fileId } = req.body || {};
+    if (!fileId) {
+      return res.status(400).json({ success: false, error: 'fileId is required' });
+    }
+
+    const accessToken = await getAccountBAccessToken();
 
     workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-'));
     const inputPath = path.join(workDir, 'input.pdf');
     const outputPath = path.join(workDir, 'output.pdf');
 
     // -----------------------------------------------------------------
-    // 1. Download directly from Drive - streamed to disk. Cloud Run has
-    //    no ~50MB ceiling the way Apps Script's UrlFetchApp does, so
-    //    this works fine for files well past that size.
+    // 1. Download the source file, authenticated as Account B (which
+    //    has been shared Viewer access to the source folders).
     // -----------------------------------------------------------------
     const driveResp = await fetch(
       `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-      { headers: { Authorization: `Bearer ${oauthToken}` } }
+      { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     if (!driveResp.ok) {
       const errText = await driveResp.text();
@@ -64,8 +105,7 @@ app.post('/compress', async (req, res) => {
     const originalSize = fs.statSync(inputPath).size;
 
     // -----------------------------------------------------------------
-    // 2. Compress with Ghostscript. Try "ebook" first (good balance),
-    //    fall back to "screen" (more aggressive) if still too big.
+    // 2. Compress with Ghostscript.
     // -----------------------------------------------------------------
     await runGhostscript(inputPath, outputPath, 'ebook');
     let compressedSize = fs.statSync(outputPath).size;
@@ -85,19 +125,20 @@ app.post('/compress', async (req, res) => {
     }
 
     // -----------------------------------------------------------------
-    // 3. Upload the compressed copy back to Drive, in the same parent
-    //    folder as the original, named "<original>_compressed.pdf".
+    // 3. Upload the compressed copy into Account B's fixed output
+    //    folder - Account B owns this file, so it counts against
+    //    Account B's quota, not Account A's.
     // -----------------------------------------------------------------
     const metaResp = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}?fields=parents,name`,
-      { headers: { Authorization: `Bearer ${oauthToken}` } }
+      `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     const metaJson = await metaResp.json();
     const baseName = (metaJson.name || 'file').replace(/\.pdf$/i, '');
 
     const metadata = {
       name: `${baseName}_compressed.pdf`,
-      parents: metaJson.parents || undefined
+      parents: [DRIVE_B_OUTPUT_FOLDER_ID]
     };
 
     const boundary = 'gcbridgeboundary';
@@ -116,7 +157,7 @@ app.post('/compress', async (req, res) => {
       {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${oauthToken}`,
+          Authorization: `Bearer ${accessToken}`,
           'Content-Type': `multipart/related; boundary=${boundary}`
         },
         body: multipartBody
